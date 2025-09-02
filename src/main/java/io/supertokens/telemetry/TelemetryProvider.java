@@ -20,6 +20,7 @@ import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanBuilder;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.propagation.ContextPropagators;
@@ -36,19 +37,19 @@ import io.supertokens.ResourceDistributor;
 import io.supertokens.config.Config;
 import io.supertokens.pluginInterface.multitenancy.TenantIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
+import io.supertokens.pluginInterface.opentelemetry.OtelProvider;
 import org.jetbrains.annotations.TestOnly;
 
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import static io.opentelemetry.semconv.ServiceAttributes.SERVICE_NAME;
 
-public class TelemetryProvider extends ResourceDistributor.SingletonResource {
-
-    private static final String RESOURCE_ID = "io.supertokens.telemetry.TelemetryProvider";
+public class TelemetryProvider extends ResourceDistributor.SingletonResource implements OtelProvider {
 
     private final OpenTelemetry openTelemetry;
 
-    private static synchronized TelemetryProvider getInstance(Main main) {
+    public static synchronized TelemetryProvider getInstance(Main main) {
         TelemetryProvider instance = null;
         try {
             instance = (TelemetryProvider) main.getResourceDistributor()
@@ -63,21 +64,54 @@ public class TelemetryProvider extends ResourceDistributor.SingletonResource {
                 .setResource(TenantIdentifier.BASE_TENANT, RESOURCE_ID, new TelemetryProvider(main));
     }
 
-    public static void createLogEvent(Main main, TenantIdentifier tenantIdentifier, String logMessage,
+    @Override
+    public void createLogEvent(TenantIdentifier tenantIdentifier, String logMessage,
                                String logLevel) {
-        getInstance(main).openTelemetry.getTracer("core-tracer")
-                .spanBuilder(logLevel)
-                .setParent(Context.current())
-                .setAttribute("tenant.connectionUriDomain", tenantIdentifier.getConnectionUriDomain())
-                .setAttribute("tenant.appId", tenantIdentifier.getAppId())
-                .setAttribute("tenant.tenantId", tenantIdentifier.getTenantId())
-                .startSpan()
+        createLogEvent(tenantIdentifier, logMessage, logLevel, Map.of());
+    }
+
+    @Override
+    public void createLogEvent(TenantIdentifier tenantIdentifier, String logMessage,
+                               String logLevel, Map<String, String> additionalAttributes) {
+        if (openTelemetry == null) {
+            return; // no telemetry provider available
+        }
+        SpanBuilder spanBuilder = createSpanBuilder(tenantIdentifier, logLevel, additionalAttributes);
+
+
+        spanBuilder.startSpan()
                 .addEvent("log",
                         Attributes.builder()
                                 .put("message", logMessage)
                                 .build(),
                         System.currentTimeMillis(), TimeUnit.MILLISECONDS)
                 .end();
+    }
+
+    private SpanBuilder createSpanBuilder(TenantIdentifier tenantIdentifier, String spanName,
+                                          Map<String, String> additionalAttributes) {
+        SpanBuilder spanBuilder = openTelemetry.getTracer("core-tracer")
+                .spanBuilder(spanName)
+                .setParent(Context.current());
+
+        return addAttributesToSpanBuilder(spanBuilder, tenantIdentifier, additionalAttributes);
+    }
+
+    private SpanBuilder addAttributesToSpanBuilder(SpanBuilder spanBuilder, TenantIdentifier tenantIdentifier,
+                                                   Map<String, String> additionalAttributes) {
+        spanBuilder
+                .setAttribute("tenant.connectionUriDomain", tenantIdentifier.getConnectionUriDomain())
+                .setAttribute("tenant.appId", tenantIdentifier.getAppId())
+                .setAttribute("tenant.tenantId", tenantIdentifier.getTenantId());
+
+        if (additionalAttributes != null && !additionalAttributes.isEmpty()) {
+            // Add additional attributes to the span
+            for (Map.Entry<String, String> attribute : additionalAttributes.entrySet()) {
+                spanBuilder.setAttribute(attribute.getKey(), attribute.getValue());
+            }
+        }
+
+        return spanBuilder;
     }
 
     public static Span startSpan(Main main, TenantIdentifier tenantIdentifier, String spanName) {
@@ -109,6 +143,12 @@ public class TelemetryProvider extends ResourceDistributor.SingletonResource {
 
 
     private static OpenTelemetry initializeOpenTelemetry(Main main) {
+        String collectorUri = Config.getBaseConfig(main).getOtelCollectorConnectionURI();
+
+        if (collectorUri == null || collectorUri.isEmpty()) {
+            return null;
+        }
+
         if (getInstance(main) != null && getInstance(main).openTelemetry != null) {
             return getInstance(main).openTelemetry; // already initialized
         }
@@ -116,8 +156,6 @@ public class TelemetryProvider extends ResourceDistributor.SingletonResource {
         Resource resource = Resource.getDefault().toBuilder()
                 .put(SERVICE_NAME, "supertokens-core")
                 .build();
-
-        String collectorUri = Config.getBaseConfig(main).getOtelCollectorConnectionURI();
 
         SdkTracerProvider sdkTracerProvider =
                 SdkTracerProvider.builder()
